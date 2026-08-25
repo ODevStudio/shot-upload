@@ -1,0 +1,50 @@
+name: Validate and release plugin
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Validate plugin
+        run: |
+          set -euo pipefail
+          node --check shot-upload.reaplugin/plugin.js
+          node --test test/plugin.test.js
+          test -s shot-upload.reaplugin/plugin.js
+          test -s shot-upload.reaplugin/manifest.json
+          jq -e '.id == "shot-upload.reaplugin"' shot-upload.reaplugin/manifest.json >/dev/null
+          jq -e '.apiVersion == 1 and (.version | type == "string")' shot-upload.reaplugin/manifest.json >/dev/null
+          jq -e '.permissions | contains(["log", "api", "emit", "pluginStorage", "proxy.decent_api.write", "events.machine", "events.shots"])' shot-upload.reaplugin/manifest.json >/dev/null
+          grep -q 'createPlugin' shot-upload.reaplugin/plugin.js
+          manifest_version="$(jq -r '.version' shot-upload.reaplugin/manifest.json)"
+          grep -q "const VERSION = \"$manifest_version\";" shot-upload.reaplugin/plugin.js
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] && [[ "${GITHUB_REF_NAME#v}" != "$manifest_version" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match plugin version $manifest_version" >&2
+            exit 1
+          fi
+
+      - name: Create release archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: zip -r "shot-upload.reaplugin-${GITHUB_REF_NAME}.zip" shot-upload.reaplugin
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: shot-upload.reaplugin-${{ github.ref_name }}.zip
+          generate_release_notes: true
