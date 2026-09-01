@@ -145,7 +145,7 @@ function createPlugin(host) {
     };
   }
 
-  async function withMachine(shot, manualRetry) {
+  async function withMachine(shot, manualRetry, replacementMachine) {
     const captured = shot && shot.workflow && shot.workflow.machine;
     let machine = capturedMachine(shot);
     if (captured && captured.serialNumber && !machine) return null;
@@ -153,11 +153,18 @@ function createPlugin(host) {
     if (hasProvenanceStatus) {
       if (captured.provenanceStatus === "captured" && !machine) return null;
       if (captured.provenanceStatus === "unavailable") {
-        if (!manualRetry) return null;
-        machine = null;
+        if (replacementMachine !== undefined) machine = replacementMachine;
+        else {
+          if (!manualRetry) return null;
+          machine = null;
+        }
       } else if (captured.provenanceStatus !== "captured") {
         return null;
       }
+    }
+    if (!machine && replacementMachine !== undefined) {
+      if (!replacementMachine) return null;
+      machine = replacementMachine;
     }
     if (!machine) {
       const current = await fetchLocal("/machine/info");
@@ -243,17 +250,19 @@ function createPlugin(host) {
     if (extras.upload_skipped === "mock-device") throw skipped(`shot ${shotId} came from a mock device`, true);
 
     const dur = shotDuration(full);
-    if (dur < state.lengthThreshold) {
+    if (!replace && dur < state.lengthThreshold) {
       throw skipped(`shot too short (${dur.toFixed(1)}s < ${state.lengthThreshold}s)`, true);
     }
 
-    const payload = await withMachine(full, manualRetry);
+    const previousUpload = replace && state.recentUploads.find((entry) => entry && entry.localId === full.id && entry.sn);
+    const replacementMachine = replace ? (previousUpload ? { serialNumber: String(previousUpload.sn) } : null) : undefined;
+    const payload = await withMachine(full, manualRetry, replacementMachine);
     if (!payload) {
       const captured = full.workflow && full.workflow.machine;
       const hasProvenanceStatus = captured && Object.prototype.hasOwnProperty.call(captured, "provenanceStatus");
-      const terminal = !manualRetry && Boolean(captured) && (hasProvenanceStatus
+      const terminal = replace || (!manualRetry && Boolean(captured) && (hasProvenanceStatus
         ? captured.provenanceStatus !== "captured" || capturedMachine(full) === null
-        : Boolean(captured.serialNumber) && capturedMachine(full) === null);
+        : Boolean(captured.serialNumber) && capturedMachine(full) === null));
       throw skipped("no real machine serial available", terminal);
     }
 

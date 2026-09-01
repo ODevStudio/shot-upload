@@ -204,6 +204,9 @@ function loadPlugin({
     setMachineState(value) {
       machineState = value;
     },
+    setConnectedMachine(value) {
+      connectedMachine = value;
+    },
     updateShot(id, value) {
       fullShots.set(id, value);
     },
@@ -275,6 +278,49 @@ test("shotUpdated replaces an uploaded shot with its latest persisted metadata",
   assert.equal(harness.proxyCalls[0].options.query.replace, "1");
   assert.equal(JSON.parse(harness.proxyCalls[0].options.body).annotations.espressoNotes, "updated note");
   assert.equal(Boolean(harness.puts[0].body.annotations.extras.uploaded_to_decent), true);
+});
+
+test("legacy replacement keeps the machine used for the original upload", async () => {
+  const harness = loadPlugin({
+    shots: [shot("legacy", { capturedMachine: false })],
+    connectedMachine: { serialNumber: "machine-a", model: "DE1Pro", version: "1352" },
+  });
+
+  harness.plugin.onEvent({ name: "shotStored", payload: { id: "legacy" } });
+  await pump();
+  harness.setConnectedMachine({ serialNumber: "machine-b", model: "DE1XL", version: "1400" });
+  harness.plugin.onEvent({
+    name: "shotUpdated",
+    payload: { id: "legacy", patch: { annotations: { espressoNotes: "edited" } } },
+  });
+  await pump();
+
+  assert.equal(harness.proxyCalls.length, 2);
+  assert.equal(JSON.parse(harness.proxyCalls[0].options.body).machine.serialNumber, "machine-a");
+  assert.equal(JSON.parse(harness.proxyCalls[1].options.body).machine.serialNumber, "machine-a");
+  assert.equal(harness.proxyCalls[1].options.query.replace, "1");
+});
+
+test("replacement ignores a length threshold raised after initial upload", async () => {
+  const harness = loadPlugin({
+    settings: { AutoUpload: true, LengthThreshold: 5 },
+    shots: [shot("short-after-upload")],
+  });
+
+  harness.plugin.onEvent({ name: "shotStored", payload: { id: "short-after-upload" } });
+  await pump();
+  harness.plugin.onEvent({
+    name: "settingsUpdated",
+    payload: { AutoUpload: true, LengthThreshold: 31 },
+  });
+  harness.plugin.onEvent({
+    name: "shotUpdated",
+    payload: { id: "short-after-upload", patch: { annotations: { espressoNotes: "edited" } } },
+  });
+  await pump();
+
+  assert.equal(harness.proxyCalls.length, 2);
+  assert.equal(harness.proxyCalls[1].options.query.replace, "1");
 });
 
 for (const key of ["uploaded_to_decent", "decent_upload_rejected"]) {
