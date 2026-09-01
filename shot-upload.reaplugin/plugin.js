@@ -224,30 +224,38 @@ function createPlugin(host) {
     return shot && shot.annotations && shot.annotations.extras || {};
   }
 
-  function skipped(message) {
+  function skipped(message, terminal = false) {
     const error = new Error(message);
     error.skipped = true;
+    error.terminal = terminal;
     return error;
   }
 
   async function uploadShot(shotId, { manualRetry = false, replace = false } = {}) {
-    if (!replace && remotelyPostedShotIds.has(shotId)) throw skipped(`shot ${shotId} already uploaded`);
-    if (!replace && !manualRetry && permanentlyRejectedShotIds.has(shotId)) throw skipped(`shot ${shotId} was rejected`);
+    if (!replace && remotelyPostedShotIds.has(shotId)) throw skipped(`shot ${shotId} already uploaded`, true);
+    if (!replace && !manualRetry && permanentlyRejectedShotIds.has(shotId)) throw skipped(`shot ${shotId} was rejected`, true);
     const full = await fetchLocal(`/shots/${shotId}`);
-    if (!full || !full.id) throw skipped(`shot ${shotId} not found`);
+    if (!full || !full.id) throw skipped(`shot ${shotId} not found`, true);
 
     const extras = extrasFor(full);
-    if (!replace && extras.uploaded_to_decent) throw skipped(`shot ${shotId} already uploaded`);
-    if (!replace && extras.decent_upload_rejected && !manualRetry) throw skipped(`shot ${shotId} was rejected`);
-    if (extras.upload_skipped === "mock-device") throw skipped(`shot ${shotId} came from a mock device`);
+    if (!replace && extras.uploaded_to_decent) throw skipped(`shot ${shotId} already uploaded`, true);
+    if (!replace && extras.decent_upload_rejected && !manualRetry) throw skipped(`shot ${shotId} was rejected`, true);
+    if (extras.upload_skipped === "mock-device") throw skipped(`shot ${shotId} came from a mock device`, true);
 
     const dur = shotDuration(full);
     if (dur < state.lengthThreshold) {
-      throw skipped(`shot too short (${dur.toFixed(1)}s < ${state.lengthThreshold}s)`);
+      throw skipped(`shot too short (${dur.toFixed(1)}s < ${state.lengthThreshold}s)`, true);
     }
 
     const payload = await withMachine(full, manualRetry);
-    if (!payload) throw skipped("no real machine serial available");
+    if (!payload) {
+      const captured = full.workflow && full.workflow.machine;
+      const hasProvenanceStatus = captured && Object.prototype.hasOwnProperty.call(captured, "provenanceStatus");
+      const terminal = !manualRetry && Boolean(captured) && (hasProvenanceStatus
+        ? captured.provenanceStatus !== "captured" || capturedMachine(full) === null
+        : Boolean(captured.serialNumber) && capturedMachine(full) === null);
+      throw skipped("no real machine serial available", terminal);
+    }
 
     let result;
     try {
@@ -326,6 +334,7 @@ function createPlugin(host) {
       log(`uploaded ${shotId} -> ${r && r.profile_ref ? r.profile_ref : "ok"}`);
       return null;
     } catch (e) {
+      if (replace && e.skipped && e.terminal) clearReplacementPending(shotId);
       if (e.skipped) { log(`skipped ${shotId}: ${e.message}`); }
       else {
         if (e.permanent) {
@@ -423,7 +432,7 @@ function createPlugin(host) {
         if (attempts >= RECONCILE_BATCH_SIZE || !state.autoUpload || reconciliationPausedForConsent || unloaded || !reconciliationIsSafe()) break;
         const error = await uploadAutomatically({ shotId, replace: true });
         attempts++;
-        if (error && pendingReplacementShotIds.has(shotId)) throw error;
+        if (error && !error.skipped && pendingReplacementShotIds.has(shotId)) throw error;
       }
       while (pages < RECONCILE_PAGE_LIMIT && attempts < RECONCILE_BATCH_SIZE && state.autoUpload && !reconciliationPausedForConsent && !unloaded && reconciliationIsSafe()) {
         const page = await fetchLocal(`/shots?limit=${RECONCILE_PAGE_SIZE}&offset=${state.reconcileOffset}&order=desc`);
@@ -570,7 +579,7 @@ function createPlugin(host) {
         case "shotUpdated": {
           const payload = event.payload || {};
           // Marker PUTs emit shotUpdated too; only suppress patches exclusively owned by this uploader.
-          if (payload.id && state.autoUpload && !isUploaderBookkeepingPatch(payload.patch)) {
+          if (payload.id && !isUploaderBookkeepingPatch(payload.patch)) {
             markReplacementPending(payload.id);
             autoUpload(payload.id, true);
           }

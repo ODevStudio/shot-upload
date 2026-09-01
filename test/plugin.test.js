@@ -480,6 +480,48 @@ test("pending replacement resumes from plugin storage", async () => {
   assert.equal(JSON.parse(harness.proxyCalls[0].options.body).annotations.espressoNotes, "persisted");
 });
 
+test("missing pending replacement does not block normal reconciliation", async () => {
+  const harness = loadPlugin({ shots: [shot("eligible")] });
+
+  harness.plugin.onEvent({
+    name: "storageRead",
+    payload: { key: "pendingReplacementShotIds", value: ["deleted"] },
+  });
+  assert.equal(await harness.runNextTimer(), true);
+
+  assert.deepEqual(
+    harness.proxyCalls.map((call) => JSON.parse(call.options.body).id),
+    ["eligible"],
+  );
+  assert.equal(Object.keys(harness.proxyCalls[0].options.query).length, 0);
+});
+
+test("edit intent recorded while AutoUpload is off runs after enabling", async () => {
+  const harness = loadPlugin({
+    settings: { AutoUpload: false, LengthThreshold: 0 },
+    shots: [shot("edited", { uploaded: true, espressoNotes: "offline edit" })],
+  });
+
+  harness.plugin.onEvent({
+    name: "shotUpdated",
+    payload: {
+      id: "edited",
+      patch: { annotations: { espressoNotes: "offline edit" } },
+    },
+  });
+  await pump();
+  assert.equal(harness.proxyCalls.length, 0);
+
+  harness.plugin.onEvent({
+    name: "settingsUpdated",
+    payload: { AutoUpload: true, LengthThreshold: 0 },
+  });
+  assert.equal(await harness.runNextTimer(), true);
+
+  assert.equal(harness.proxyCalls.length, 1);
+  assert.equal(harness.proxyCalls[0].options.query.replace, "1");
+});
+
 test("reconciliation uploads only eligible captured shots", async () => {
   const harness = loadPlugin({
     shots: [
