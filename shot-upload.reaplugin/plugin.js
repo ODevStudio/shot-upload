@@ -46,6 +46,7 @@ function createPlugin(host) {
   let pendingLiveShots = [];
   const remotelyPostedShotIds = new Set();
   const permanentlyRejectedShotIds = new Set();
+  let pendingReplacementShotIds = new Set();
   let reconcileTimerId = null;
   let reconciliationPausedForConsent = false;
   let unloaded = false;
@@ -231,13 +232,13 @@ function createPlugin(host) {
 
   async function uploadShot(shotId, { manualRetry = false, replace = false } = {}) {
     if (!replace && remotelyPostedShotIds.has(shotId)) throw skipped(`shot ${shotId} already uploaded`);
-    if (!manualRetry && permanentlyRejectedShotIds.has(shotId)) throw skipped(`shot ${shotId} was rejected`);
+    if (!replace && !manualRetry && permanentlyRejectedShotIds.has(shotId)) throw skipped(`shot ${shotId} was rejected`);
     const full = await fetchLocal(`/shots/${shotId}`);
     if (!full || !full.id) throw skipped(`shot ${shotId} not found`);
 
     const extras = extrasFor(full);
     if (!replace && extras.uploaded_to_decent) throw skipped(`shot ${shotId} already uploaded`);
-    if (extras.decent_upload_rejected && !manualRetry) throw skipped(`shot ${shotId} was rejected`);
+    if (!replace && extras.decent_upload_rejected && !manualRetry) throw skipped(`shot ${shotId} was rejected`);
     if (extras.upload_skipped === "mock-device") throw skipped(`shot ${shotId} came from a mock device`);
 
     const dur = shotDuration(full);
@@ -293,19 +294,42 @@ function createPlugin(host) {
     return operation;
   }
 
+  function persistPendingReplacements() {
+    try { host.storage({ type: "write", key: "pendingReplacementShotIds", data: [...pendingReplacementShotIds] }); } catch (e) {}
+  }
+
+  function markReplacementPending(shotId) {
+    if (pendingReplacementShotIds.has(shotId)) return;
+    pendingReplacementShotIds = new Set([...pendingReplacementShotIds, shotId]);
+    persistPendingReplacements();
+  }
+
+  function clearReplacementPending(shotId) {
+    if (!pendingReplacementShotIds.has(shotId)) return;
+    pendingReplacementShotIds = new Set([...pendingReplacementShotIds].filter((id) => id !== shotId));
+    persistPendingReplacements();
+  }
+
   async function uploadAutomatically(operation) {
     const { shotId, replace } = operation;
+    if (replace) markReplacementPending(shotId);
     if (!replace && shotId && shotId === state.lastUploadedShot) {
       log(`shot ${shotId} already uploaded`);
       return;
     }
     try {
       const r = await uploadShot(shotId, { replace });
+      if (replace) {
+        clearReplacementPending(shotId);
+        permanentlyRejectedShotIds.delete(shotId);
+      }
       log(`uploaded ${shotId} -> ${r && r.profile_ref ? r.profile_ref : "ok"}`);
+      return null;
     } catch (e) {
       if (e.skipped) { log(`skipped ${shotId}: ${e.message}`); }
       else {
         if (e.permanent) {
+          if (replace) clearReplacementPending(shotId);
           await markRejected(shotId, e);
         }
         log(`error uploading ${shotId}: ${e.message}`);
@@ -313,6 +337,7 @@ function createPlugin(host) {
         if (e.consent) reconciliationPausedForConsent = true;
         else scheduleReconcile(RECONCILE_RETRY_MS);
       }
+      return e;
     }
   }
 
@@ -394,6 +419,12 @@ function createPlugin(host) {
       if (!await confirmReconciliationIsSafe()) return;
       let pages = 0;
       let attempts = 0;
+      for (const shotId of pendingReplacementShotIds) {
+        if (attempts >= RECONCILE_BATCH_SIZE || !state.autoUpload || reconciliationPausedForConsent || unloaded || !reconciliationIsSafe()) break;
+        const error = await uploadAutomatically({ shotId, replace: true });
+        attempts++;
+        if (error && pendingReplacementShotIds.has(shotId)) throw error;
+      }
       while (pages < RECONCILE_PAGE_LIMIT && attempts < RECONCILE_BATCH_SIZE && state.autoUpload && !reconciliationPausedForConsent && !unloaded && reconciliationIsSafe()) {
         const page = await fetchLocal(`/shots?limit=${RECONCILE_PAGE_SIZE}&offset=${state.reconcileOffset}&order=desc`);
         if (!page || !Array.isArray(page.items)) throw new Error("could not list local shots");
@@ -517,6 +548,7 @@ function createPlugin(host) {
       try { host.storage({ type: "read", key: "lastUploadedShot" }); } catch (e) {}
       try { host.storage({ type: "read", key: "reconcileOffset" }); } catch (e) {}
       try { host.storage({ type: "read", key: "recentUploads" }); } catch (e) {}
+      try { host.storage({ type: "read", key: "pendingReplacementShotIds" }); } catch (e) {}
       log(`loaded (autoUpload ${state.autoUpload})`);
       scheduleReconcile(1000);
     },
@@ -539,6 +571,7 @@ function createPlugin(host) {
           const payload = event.payload || {};
           // Marker PUTs emit shotUpdated too; only suppress patches exclusively owned by this uploader.
           if (payload.id && state.autoUpload && !isUploaderBookkeepingPatch(payload.patch)) {
+            markReplacementPending(payload.id);
             autoUpload(payload.id, true);
           }
           break;
@@ -554,6 +587,11 @@ function createPlugin(host) {
           if (event.payload && event.payload.key === "recentUploads") {
             const v = event.payload.value;
             state.recentUploads = Array.isArray(v) ? v.slice(0, RECENT_MAX) : [];
+          }
+          if (event.payload && event.payload.key === "pendingReplacementShotIds") {
+            const ids = Array.isArray(event.payload.value) ? event.payload.value.filter((id) => typeof id === "string" && id) : [];
+            pendingReplacementShotIds = new Set([...pendingReplacementShotIds, ...ids]);
+            if (pendingReplacementShotIds.size > 0) scheduleReconcile(0);
           }
           break;
         case "stateUpdate": {
