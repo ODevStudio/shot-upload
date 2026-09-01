@@ -10,6 +10,19 @@ Download `shot-upload.reaplugin-vX.Y.Z.zip` from Releases and install it through
 
 Automatic upload is off by default. Enable **Upload shots automatically** in the plugin settings to opt in.
 
+## Links to uploaded shots
+
+After a shot uploads, the plugin records a link to view it in the user's Decent
+account — `https://decentespresso.com/support/espressomachine?view=chart&sn=<serial>&id=<id>`
+(built from the machine serial and the shot id the server returns). The most
+recent 10 links are kept and exposed through the plugin's HTTP endpoints:
+
+- `GET /api/v1/plugins/shot-upload.reaplugin/status` — includes `lastUrl` and `recentUploads`.
+- `GET /api/v1/plugins/shot-upload.reaplugin/recent` — JSON `{ok, shots:[{id, sn, url, title, ts}]}`.
+- `GET /api/v1/plugins/shot-upload.reaplugin/ui` — an HTML page listing the recent uploads as links.
+
+The `shotUploaded` event also carries `{id, sn, url}` for the just-uploaded shot.
+
 ## Development
 
 The distributable source is plain JavaScript and JSON under `shot-upload.reaplugin/`. It has no build step or package dependencies.

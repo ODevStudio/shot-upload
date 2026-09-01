@@ -23,9 +23,14 @@ function createPlugin(host) {
   "use strict";
 
   const NS = "shot-upload.reaplugin";
-  const VERSION = "0.2.1";
+  const VERSION = "0.2.2";
   const LOCAL_API_URL = "http://localhost:8080/api/v1";
   const UPLOAD_PATH = "support/api/shot_upload"; // exact allowlisted proxy write path
+  // Web view of an uploaded shot in the user's Decent account. The server returns
+  // the stored shot id; combined with the machine serial it addresses the shot on
+  // decentespresso.com. e.g. .../espressomachine?view=chart&sn=6262&id=<id>
+  const SHOT_VIEW_BASE = "https://decentespresso.com/support/espressomachine";
+  const RECENT_MAX = 10; // keep links to the most recent N uploads
   const RETRIES = 3;
   const RETRY_DELAY_MS = 2000;
   const RECONCILE_PAGE_SIZE = 20;
@@ -51,11 +56,27 @@ function createPlugin(host) {
     lengthThreshold: 5,
     lastUploadedShot: null,
     lastResult: null,
+    lastUrl: null,
+    recentUploads: [], // [{id, localId, sn, url, title, ts}], newest first, max RECENT_MAX
     reconcileOffset: 0,
     machineState: null,
   };
 
   function log(msg) { try { host.log(`[shot-upload] ${msg}`); } catch (e) {} }
+
+  // Web URL for a shot the server stored, e.g.
+  // https://decentespresso.com/support/espressomachine?view=chart&sn=6262&id=<id>
+  function shotUrl(sn, id) {
+    if (!sn || !id) return null;
+    return `${SHOT_VIEW_BASE}?view=chart&sn=${encodeURIComponent(sn)}&id=${encodeURIComponent(id)}`;
+  }
+
+  // Prepend an upload to the recent list (dedup by shot id), cap at RECENT_MAX,
+  // and persist it so the links survive a restart.
+  function recordRecentUpload(entry) {
+    state.recentUploads = [entry, ...state.recentUploads.filter((e) => e && e.id !== entry.id)].slice(0, RECENT_MAX);
+    try { host.storage({ type: "write", key: "recentUploads", data: state.recentUploads }); } catch (e) {}
+  }
 
   async function fetchLocal(path) {
     const res = await fetch(`${LOCAL_API_URL}${path}`);
@@ -237,8 +258,22 @@ function createPlugin(host) {
     await markUploaded(full.id);
     state.lastUploadedShot = full.id;
     state.lastResult = result;
+    // Build the shot's web URL from the server's stored id + the machine serial,
+    // record it in the recent list, and hand it back to the app via the event.
+    const sn = payload.machine && payload.machine.serialNumber;
+    const serverId = (result && result.id) || full.id;
+    const url = shotUrl(sn, serverId);
+    state.lastUrl = url;
+    recordRecentUpload({
+      id: serverId,
+      localId: full.id,
+      sn: sn || null,
+      url: url,
+      title: (full.workflow && full.workflow.profile && full.workflow.profile.title) || null,
+      ts: Date.now(),
+    });
     host.storage({ type: "write", key: "lastUploadedShot", data: full.id });
-    host.emit("shotUploaded", { shotId: full.id, result: result, timestamp: Date.now() });
+    host.emit("shotUploaded", { shotId: full.id, id: serverId, sn: sn || null, url: url, result: result, timestamp: Date.now() });
     return result;
   }
 
@@ -409,6 +444,49 @@ function createPlugin(host) {
     return { status: status, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) };
   }
 
+  function escHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // Human-readable page listing the most recent uploads, each linking to the shot
+  // in the user's Decent account. Big tap targets — it may be shown on the DE1's
+  // touchscreen.
+  function recentShotsHtml() {
+    const items = (state.recentUploads || []).map((s) => {
+      let when = "";
+      try { when = s.ts ? new Date(s.ts).toLocaleString() : ""; } catch (e) {}
+      const label = escHtml(s.title || s.id || "shot");
+      const meta = escHtml([s.sn ? "SN " + s.sn : "", when].filter(Boolean).join(" · "));
+      return s.url
+        ? `<li><a href="${escHtml(s.url)}">${label}</a><div class="meta">${meta}</div></li>`
+        : `<li><span class="nourl">${label}</span><div class="meta">${meta}</div></li>`;
+    }).join("");
+    const list = items || '<li class="empty">No shots uploaded yet.</li>';
+    return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Recent uploaded shots</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f7; color: #1c1c22; padding: 24px; }
+  h1 { font-size: 1.6em; margin-bottom: 16px; }
+  ul.shots { list-style: none; }
+  ul.shots li { background: #fff; border-radius: 12px; padding: 20px 24px; margin-bottom: 14px; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  ul.shots a { font-size: 1.15em; font-weight: 600; color: #2f6bff; text-decoration: none; word-break: break-word; }
+  ul.shots a:active { opacity: .6; }
+  .meta { color: #6b6b76; font-size: .9em; margin-top: 6px; }
+  .empty, .nourl { color: #6b6b76; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16161a; color: #e7e7ec; }
+    ul.shots li { background: #23232a; box-shadow: none; }
+    ul.shots a { color: #7aa2ff; }
+    .meta, .empty, .nourl { color: #9a9aa5; }
+  }
+</style></head>
+<body><h1>Recent uploaded shots</h1><ul class="shots">${list}</ul></body></html>`;
+  }
+
   return {
     id: NS,
     version: VERSION,
@@ -421,6 +499,7 @@ function createPlugin(host) {
       // handled in onEvent, that restores lastUploadedShot.
       try { host.storage({ type: "read", key: "lastUploadedShot" }); } catch (e) {}
       try { host.storage({ type: "read", key: "reconcileOffset" }); } catch (e) {}
+      try { host.storage({ type: "read", key: "recentUploads" }); } catch (e) {}
       log(`loaded (autoUpload ${state.autoUpload})`);
       scheduleReconcile(1000);
     },
@@ -446,6 +525,10 @@ function createPlugin(host) {
           if (event.payload && event.payload.key === "reconcileOffset") {
             const offset = Number(event.payload.value);
             state.reconcileOffset = Number.isFinite(offset) && offset >= 0 ? Math.trunc(offset) : 0;
+          }
+          if (event.payload && event.payload.key === "recentUploads") {
+            const v = event.payload.value;
+            state.recentUploads = Array.isArray(v) ? v.slice(0, RECENT_MAX) : [];
           }
           break;
         case "stateUpdate": {
@@ -483,14 +566,28 @@ function createPlugin(host) {
           autoUpload: state.autoUpload,
           lastUploaded: state.lastUploadedShot,
           lastResult: state.lastResult,
+          lastUrl: state.lastUrl,
+          recentUploads: state.recentUploads,
         });
+      }
+      // JSON list of the recent uploads with their links (for programmatic use).
+      if (endpoint === "recent") {
+        return jsonResponse(200, { ok: true, shots: state.recentUploads });
+      }
+      // Human-readable page listing the recent uploads as links.
+      if (endpoint === "ui") {
+        return {
+          status: 200,
+          headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" },
+          body: recentShotsHtml(),
+        };
       }
       if (endpoint === "upload") {
         try {
           const latest = await fetchLocal("/shots/latest");
           if (!latest || !latest.id) return jsonResponse(404, { ok: false, error: "no shot available" });
           const result = await uploadShot(latest.id, true);
-          return jsonResponse(200, { ok: true, id: latest.id, result: result });
+          return jsonResponse(200, { ok: true, id: latest.id, url: state.lastUrl, result: result });
         } catch (e) {
           if (e.skipped) return jsonResponse(200, { ok: false, skipped: true, error: e.message });
           return jsonResponse(502, { ok: false, error: e.message });

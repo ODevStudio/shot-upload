@@ -3,7 +3,7 @@
   "author": "Decent Espresso",
   "name": "Decent shot upload",
   "description": "Uploads your espresso shots to your Decent account at decentespresso.com and catches up eligible local shots while the machine is idle. Uses captured machine identity when available and the connected real machine for legacy shots. Off by default: enable Upload shots automatically to opt in.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "apiVersion": 1,
   "permissions": [
     "log",
@@ -37,6 +37,23 @@
       "type": "http",
       "data": {
         "description": "POST to upload the latest shot now (from the currently-connected machine)"
+      }
+    },
+    {
+      "id": "recent",
+      "type": "http",
+      "data": {
+        "description": "GET the most recent uploaded shots with their decentespresso.com links (JSON)"
+      }
+    },
+    {
+      "id": "ui",
+      "type": "http",
+      "data": {
+        "body": {
+          "type": "string",
+          "description": "HTML page listing the most recent uploaded shots as links"
+        }
       }
     }
   ]
