@@ -47,6 +47,7 @@ function createPlugin(host) {
   const remotelyPostedShotIds = new Set();
   const permanentlyRejectedShotIds = new Set();
   let uploadedMachinesByShotId = new Map();
+  let uploadedRevisionsByShotId = new Map();
   let pendingReplacementShotIds = new Set();
   let reconcileTimerId = null;
   let reconciliationPausedForConsent = false;
@@ -149,6 +150,12 @@ function createPlugin(host) {
   function recordUploadedMachine(shotId, machine) {
     uploadedMachinesByShotId = new Map([...uploadedMachinesByShotId, [shotId, { ...machine }]]);
     try { host.storage({ type: "write", key: "uploadedMachines", data: Object.fromEntries(uploadedMachinesByShotId) }); } catch (e) {}
+  }
+
+  function recordUploadedRevision(shot) {
+    if (!shot || typeof shot.updatedAt !== "string" || !shot.updatedAt) return;
+    uploadedRevisionsByShotId = new Map([...uploadedRevisionsByShotId, [shot.id, shot.updatedAt]]);
+    try { host.storage({ type: "write", key: "uploadedRevisions", data: Object.fromEntries(uploadedRevisionsByShotId) }); } catch (e) {}
   }
 
   async function withMachine(shot, manualRetry, replacementMachine) {
@@ -280,6 +287,7 @@ function createPlugin(host) {
     }
     remotelyPostedShotIds.add(full.id);
     recordUploadedMachine(full.id, payload.machine);
+    recordUploadedRevision(full);
     await markUploaded(full.id);
     state.lastUploadedShot = full.id;
     state.lastResult = result;
@@ -416,7 +424,7 @@ function createPlugin(host) {
     const extras = extrasFor(shot);
     const captured = shot && shot.workflow && shot.workflow.machine;
     const hasProvenanceStatus = captured && Object.prototype.hasOwnProperty.call(captured, "provenanceStatus");
-    return !remotelyPostedShotIds.has(shot.id) &&
+    return !wasUploaded(shot) &&
       !permanentlyRejectedShotIds.has(shot.id) &&
       !extras.uploaded_to_decent &&
       !extras.decent_upload_rejected &&
@@ -424,6 +432,20 @@ function createPlugin(host) {
       (hasProvenanceStatus
         ? captured.provenanceStatus === "captured" && capturedMachine(shot) !== null
         : !captured || !captured.serialNumber || capturedMachine(shot) !== null);
+  }
+
+  function wasUploaded(shot) {
+    return Boolean(shot && (
+      remotelyPostedShotIds.has(shot.id) ||
+      uploadedMachinesByShotId.has(shot.id) ||
+      uploadedRevisionsByShotId.has(shot.id) ||
+      extrasFor(shot).uploaded_to_decent
+    ));
+  }
+
+  function reconciliationReplacement(shot) {
+    const synced = shot && uploadedRevisionsByShotId.get(shot.id);
+    return Boolean(wasUploaded(shot) && synced && typeof shot.updatedAt === "string" && shot.updatedAt !== synced);
   }
 
   function setReconcileOffset(offset) {
@@ -465,9 +487,10 @@ function createPlugin(host) {
           }
           if (reconciliationPausedForConsent || attempts >= RECONCILE_BATCH_SIZE) break;
           scanned++;
-          if (!reconcileCandidate(shot)) continue;
+          const replace = reconciliationReplacement(shot);
+          if (!replace && !reconcileCandidate(shot)) continue;
           try {
-            await uploadShot(shot.id);
+            await uploadShot(shot.id, { replace });
             attempts++;
           } catch (e) {
             if (e.skipped) continue;
@@ -518,7 +541,15 @@ function createPlugin(host) {
     const extras = annotations.extras;
     if (typeof extras !== "object" || Array.isArray(extras)) return false;
     const keys = Object.keys(extras);
-    return keys.length > 0 && keys.every((key) => key === "uploaded_to_decent" || key === "decent_upload_rejected");
+    return keys.length > 0 && keys.every((key) => key === "uploaded_to_decent" || key === "decent_upload_rejected" || key === "visualizerId");
+  }
+
+  async function handleShotUpdated(shotId) {
+    const shot = await fetchLocal(`/shots/${shotId}`);
+    if (!shot || !shot.id) return;
+    const replace = wasUploaded(shot);
+    if (replace) markReplacementPending(shotId);
+    autoUpload(shotId, replace);
   }
 
   // Human-readable page listing the most recent uploads, each linking to the shot
@@ -573,6 +604,7 @@ function createPlugin(host) {
       try { host.storage({ type: "read", key: "reconcileOffset" }); } catch (e) {}
       try { host.storage({ type: "read", key: "recentUploads" }); } catch (e) {}
       try { host.storage({ type: "read", key: "uploadedMachines" }); } catch (e) {}
+      try { host.storage({ type: "read", key: "uploadedRevisions" }); } catch (e) {}
       try { host.storage({ type: "read", key: "pendingReplacementShotIds" }); } catch (e) {}
       log(`loaded (autoUpload ${state.autoUpload})`);
       scheduleReconcile(1000);
@@ -596,8 +628,7 @@ function createPlugin(host) {
           const payload = event.payload || {};
           // Marker PUTs emit shotUpdated too; only suppress patches exclusively owned by this uploader.
           if (payload.id && !isUploaderBookkeepingPatch(payload.patch)) {
-            markReplacementPending(payload.id);
-            autoUpload(payload.id, true);
+            handleShotUpdated(payload.id).catch((e) => log(`could not classify updated shot ${payload.id}: ${e.message}`));
           }
           break;
         }
@@ -621,6 +652,13 @@ function createPlugin(host) {
                 .filter(([, machine]) => machine)
               : [];
             uploadedMachinesByShotId = new Map([...stored, ...uploadedMachinesByShotId]);
+          }
+          if (event.payload && event.payload.key === "uploadedRevisions") {
+            const v = event.payload.value;
+            const stored = v && typeof v === "object" && !Array.isArray(v)
+              ? Object.entries(v).filter(([shotId, revision]) => shotId && typeof revision === "string" && revision)
+              : [];
+            uploadedRevisionsByShotId = new Map([...stored, ...uploadedRevisionsByShotId]);
           }
           if (event.payload && event.payload.key === "pendingReplacementShotIds") {
             const ids = Array.isArray(event.payload.value) ? event.payload.value.filter((id) => typeof id === "string" && id) : [];
