@@ -3,7 +3,7 @@
   "author": "Decent Espresso",
   "name": "Decent shot upload",
   "description": "Uploads your espresso shots to your Decent account at decentespresso.com and catches up eligible local shots while the machine is idle. Uses captured machine identity when available and the connected real machine for legacy shots. Off by default: enable Upload shots automatically to opt in.",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "apiVersion": 1,
   "permissions": [
     "log",
