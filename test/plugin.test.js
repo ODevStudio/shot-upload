@@ -15,11 +15,13 @@ function shot(
     uploaded = false,
     rejected = false,
     mockDeviceSkipped = false,
+    espressoNotes,
   } = {},
 ) {
   return {
     id,
     annotations: {
+      ...(espressoNotes ? { espressoNotes } : {}),
       extras: {
         ...(uploaded ? { uploaded_to_decent: 1 } : {}),
         ...(rejected
@@ -71,6 +73,7 @@ function loadPlugin({
   responseStatuses = [],
   consentDenied = false,
   annotationStatus = 200,
+  beforeProxy,
 } = {}) {
   const proxyCalls = [];
   const fetches = [];
@@ -180,6 +183,7 @@ function loadPlugin({
         throw error;
       }
       proxyCalls.push({ path: proxyPath, options });
+      if (beforeProxy) await beforeProxy(proxyCalls.length);
       const status = statuses.length ? statuses.shift() : 200;
       return {
         status,
@@ -200,6 +204,9 @@ function loadPlugin({
     setMachineState(value) {
       machineState = value;
     },
+    updateShot(id, value) {
+      fullShots.set(id, value);
+    },
     async runNextTimer() {
       while (timers.length) {
         const timer = timers.shift();
@@ -214,9 +221,16 @@ function loadPlugin({
 }
 
 test("automatic upload remains opt-in", async () => {
-  const harness = loadPlugin({ settings: {}, shots: [shot("shot-1")] });
+  const harness = loadPlugin({ settings: {}, shots: [shot("shot-1", { uploaded: true })] });
 
   harness.plugin.onEvent({ name: "shotStored", payload: { id: "shot-1" } });
+  harness.plugin.onEvent({
+    name: "shotUpdated",
+    payload: {
+      id: "shot-1",
+      patch: { annotations: { espressoNotes: "changed" } },
+    },
+  });
   await pump();
 
   assert.equal(harness.proxyCalls.length, 0);
@@ -231,6 +245,7 @@ test("shotStored uploads the persisted shot with captured identity", async () =>
 
   assert.equal(harness.proxyCalls.length, 1);
   assert.equal(harness.proxyCalls[0].path, "support/api/shot_upload");
+  assert.equal(Object.keys(harness.proxyCalls[0].options.query).length, 0);
   const payload = JSON.parse(harness.proxyCalls[0].options.body);
   assert.equal(payload.id, "shot-1");
   assert.equal(payload.machine.serialNumber, "6262");
@@ -240,6 +255,158 @@ test("shotStored uploads the persisted shot with captured identity", async () =>
     false,
   );
   assert.equal(Boolean(harness.puts[0].body.annotations.extras.uploaded_to_decent), true);
+});
+
+test("shotUpdated replaces an uploaded shot with its latest persisted metadata", async () => {
+  const edited = shot("shot-1", { uploaded: true, espressoNotes: "updated note" });
+  const harness = loadPlugin({ shots: [edited] });
+
+  harness.plugin.onEvent({
+    name: "shotUpdated",
+    payload: {
+      id: "shot-1",
+      patch: { annotations: { espressoNotes: "updated note" } },
+    },
+  });
+  await pump();
+
+  assert.equal(harness.proxyCalls.length, 1);
+  assert.equal(harness.proxyCalls[0].path, "support/api/shot_upload");
+  assert.equal(harness.proxyCalls[0].options.query.replace, "1");
+  assert.equal(JSON.parse(harness.proxyCalls[0].options.body).annotations.espressoNotes, "updated note");
+  assert.equal(Boolean(harness.puts[0].body.annotations.extras.uploaded_to_decent), true);
+});
+
+for (const key of ["uploaded_to_decent", "decent_upload_rejected"]) {
+  test(`shotUpdated ignores uploader bookkeeping for ${key}`, async () => {
+    const harness = loadPlugin({ shots: [shot("shot-1", { uploaded: true })] });
+
+    harness.plugin.onEvent({
+      name: "shotUpdated",
+      payload: {
+        id: "shot-1",
+        patch: { annotations: { extras: { [key]: 123 } } },
+      },
+    });
+    await pump();
+
+    assert.equal(harness.proxyCalls.length, 0);
+  });
+}
+
+test("shotUpdated replaces when uploader bookkeeping is mixed with a user edit", async () => {
+  const harness = loadPlugin({
+    shots: [shot("shot-1", { uploaded: true, espressoNotes: "updated note" })],
+  });
+
+  harness.plugin.onEvent({
+    name: "shotUpdated",
+    payload: {
+      id: "shot-1",
+      patch: {
+        annotations: {
+          espressoNotes: "updated note",
+          extras: { uploaded_to_decent: 123 },
+        },
+      },
+    },
+  });
+  await pump();
+
+  assert.equal(harness.proxyCalls.length, 1);
+  assert.equal(harness.proxyCalls[0].options.query.replace, "1");
+});
+
+test("queued shotUpdated retains replacement mode", async () => {
+  let releaseFirst;
+  const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
+  const harness = loadPlugin({
+    shots: [shot("new"), shot("edited", { uploaded: true })],
+    beforeProxy: (callNumber) => callNumber === 1 ? firstBlocked : undefined,
+  });
+
+  harness.plugin.onEvent({ name: "shotStored", payload: { id: "new" } });
+  await pump();
+  harness.plugin.onEvent({ name: "shotStored", payload: { id: "edited" } });
+  harness.plugin.onEvent({
+    name: "shotUpdated",
+    payload: {
+      id: "edited",
+      patch: { annotations: { espressoNotes: "changed" } },
+    },
+  });
+  releaseFirst();
+  await pump();
+
+  assert.equal(harness.proxyCalls.length, 2);
+  assert.equal(harness.proxyCalls[1].options.query.replace, "1");
+});
+
+test("rapid shotUpdated events coalesce pending work and upload the latest state", async () => {
+  let releaseFirst;
+  const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
+  const initial = shot("edited", { uploaded: true, espressoNotes: "first" });
+  const harness = loadPlugin({
+    shots: [initial],
+    beforeProxy: (callNumber) => callNumber === 1 ? firstBlocked : undefined,
+  });
+  const event = {
+    name: "shotUpdated",
+    payload: {
+      id: "edited",
+      patch: { annotations: { espressoNotes: "changed" } },
+    },
+  };
+
+  harness.plugin.onEvent(event);
+  await pump();
+  harness.updateShot("edited", shot("edited", { uploaded: true, espressoNotes: "latest" }));
+  harness.plugin.onEvent(event);
+  harness.plugin.onEvent(event);
+  releaseFirst();
+  await pump();
+
+  assert.equal(harness.proxyCalls.length, 2);
+  assert.equal(harness.proxyCalls[1].options.query.replace, "1");
+  assert.equal(JSON.parse(harness.proxyCalls[1].options.body).annotations.espressoNotes, "latest");
+});
+
+test("a posted shot can be replaced without reacting to replacement bookkeeping", async () => {
+  const harness = loadPlugin({ shots: [shot("edited")] });
+
+  harness.plugin.onEvent({ name: "shotStored", payload: { id: "edited" } });
+  await pump();
+  harness.updateShot("edited", shot("edited", { uploaded: true, espressoNotes: "changed" }));
+
+  harness.plugin.onEvent({
+    name: "shotUpdated",
+    payload: {
+      id: "edited",
+      patch: { annotations: { espressoNotes: "changed" } },
+    },
+  });
+  await pump();
+
+  assert.equal(harness.proxyCalls.length, 2);
+  assert.equal(harness.proxyCalls[1].options.query.replace, "1");
+
+  harness.plugin.onEvent({
+    name: "shotUpdated",
+    payload: {
+      id: "edited",
+      patch: {
+        annotations: {
+          extras: {
+            uploaded_to_decent: 123,
+            decent_upload_rejected: null,
+          },
+        },
+      },
+    },
+  });
+  await pump();
+
+  assert.equal(harness.proxyCalls.length, 2);
 });
 
 test("reconciliation uploads only eligible captured shots", async () => {

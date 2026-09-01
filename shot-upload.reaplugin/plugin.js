@@ -43,7 +43,7 @@ function createPlugin(host) {
 
   let isUploading = false;
   let isReconciling = false;
-  let pendingLiveShotIds = [];
+  let pendingLiveShots = [];
   const remotelyPostedShotIds = new Set();
   const permanentlyRejectedShotIds = new Set();
   let reconcileTimerId = null;
@@ -177,7 +177,7 @@ function createPlugin(host) {
   }
 
   // POST the shot through the authenticated Decent proxy (reuses account login).
-  async function postShot(shot) {
+  async function postShot(shot, replace) {
     const body = JSON.stringify(shot);
     let lastErr = null;
     for (let i = 0; i < RETRIES; i++) {
@@ -190,6 +190,7 @@ function createPlugin(host) {
       try {
         const res = await host.decentProxy(UPLOAD_PATH, {
           method: "POST",
+          query: replace ? { replace: "1" } : {},
           body: body,
           contentType: "application/json",
         });
@@ -228,14 +229,14 @@ function createPlugin(host) {
     return error;
   }
 
-  async function uploadShot(shotId, manualRetry) {
-    if (remotelyPostedShotIds.has(shotId)) throw skipped(`shot ${shotId} already uploaded`);
+  async function uploadShot(shotId, { manualRetry = false, replace = false } = {}) {
+    if (!replace && remotelyPostedShotIds.has(shotId)) throw skipped(`shot ${shotId} already uploaded`);
     if (!manualRetry && permanentlyRejectedShotIds.has(shotId)) throw skipped(`shot ${shotId} was rejected`);
     const full = await fetchLocal(`/shots/${shotId}`);
     if (!full || !full.id) throw skipped(`shot ${shotId} not found`);
 
     const extras = extrasFor(full);
-    if (extras.uploaded_to_decent) throw skipped(`shot ${shotId} already uploaded`);
+    if (!replace && extras.uploaded_to_decent) throw skipped(`shot ${shotId} already uploaded`);
     if (extras.decent_upload_rejected && !manualRetry) throw skipped(`shot ${shotId} was rejected`);
     if (extras.upload_skipped === "mock-device") throw skipped(`shot ${shotId} came from a mock device`);
 
@@ -249,7 +250,7 @@ function createPlugin(host) {
 
     let result;
     try {
-      result = await postShot(payload);
+      result = await postShot(payload, replace);
     } catch (e) {
       if (e.permanent) permanentlyRejectedShotIds.add(full.id);
       throw e;
@@ -277,25 +278,29 @@ function createPlugin(host) {
     return result;
   }
 
-  function queueLiveShot(shotId) {
-    if (!pendingLiveShotIds.includes(shotId)) {
-      pendingLiveShotIds = [...pendingLiveShotIds, shotId];
-    }
+  function queueLiveShot(operation) {
+    const queued = pendingLiveShots.find((item) => item.shotId === operation.shotId);
+    pendingLiveShots = queued
+      ? pendingLiveShots.map((item) => item.shotId === operation.shotId
+        ? { shotId: item.shotId, replace: item.replace || operation.replace }
+        : item)
+      : [...pendingLiveShots, operation];
   }
 
   function takeLiveShot() {
-    const shotId = pendingLiveShotIds[0];
-    pendingLiveShotIds = pendingLiveShotIds.slice(1);
-    return shotId;
+    const operation = pendingLiveShots[0];
+    pendingLiveShots = pendingLiveShots.slice(1);
+    return operation;
   }
 
-  async function uploadAutomatically(shotId) {
-    if (shotId && shotId === state.lastUploadedShot) {
+  async function uploadAutomatically(operation) {
+    const { shotId, replace } = operation;
+    if (!replace && shotId && shotId === state.lastUploadedShot) {
       log(`shot ${shotId} already uploaded`);
       return;
     }
     try {
-      const r = await uploadShot(shotId, false);
+      const r = await uploadShot(shotId, { replace });
       log(`uploaded ${shotId} -> ${r && r.profile_ref ? r.profile_ref : "ok"}`);
     } catch (e) {
       if (e.skipped) { log(`skipped ${shotId}: ${e.message}`); }
@@ -311,19 +316,20 @@ function createPlugin(host) {
     }
   }
 
-  async function autoUpload(shotId) {
+  async function autoUpload(shotId, replace = false) {
     if (!state.autoUpload || reconciliationPausedForConsent || unloaded) return;
+    const operation = { shotId, replace };
     if (isUploading || isReconciling) {
-      queueLiveShot(shotId);
+      queueLiveShot(operation);
       return;
     }
     isUploading = true;
     try {
-      await uploadAutomatically(shotId);
+      await uploadAutomatically(operation);
     } finally {
       isUploading = false;
-      const nextShotId = takeLiveShot();
-      if (nextShotId) autoUpload(nextShotId);
+      const nextOperation = takeLiveShot();
+      if (nextOperation) autoUpload(nextOperation.shotId, nextOperation.replace);
     }
   }
 
@@ -398,7 +404,7 @@ function createPlugin(host) {
         let scanned = 0;
         for (const shot of page.items) {
           if (!state.autoUpload || reconciliationPausedForConsent || unloaded || !reconciliationIsSafe() || attempts >= RECONCILE_BATCH_SIZE) break;
-          while (pendingLiveShotIds.length > 0 && attempts < RECONCILE_BATCH_SIZE && !reconciliationPausedForConsent) {
+          while (pendingLiveShots.length > 0 && attempts < RECONCILE_BATCH_SIZE && !reconciliationPausedForConsent) {
             await uploadAutomatically(takeLiveShot());
             attempts++;
           }
@@ -406,7 +412,7 @@ function createPlugin(host) {
           scanned++;
           if (!reconcileCandidate(shot)) continue;
           try {
-            await uploadShot(shot.id, false);
+            await uploadShot(shot.id);
             attempts++;
           } catch (e) {
             if (e.skipped) continue;
@@ -430,9 +436,9 @@ function createPlugin(host) {
       nextDelay = e.consent ? null : RECONCILE_RETRY_MS;
     } finally {
       isReconciling = false;
-      const nextShotId = reconciliationPausedForConsent ? null : takeLiveShot();
-      if (nextShotId) {
-        autoUpload(nextShotId);
+      const nextOperation = reconciliationPausedForConsent ? null : takeLiveShot();
+      if (nextOperation) {
+        autoUpload(nextOperation.shotId, nextOperation.replace);
         scheduleReconcile(RECONCILE_CONTINUE_MS);
       } else if (nextDelay !== null) {
         scheduleReconcile(nextDelay);
@@ -447,6 +453,17 @@ function createPlugin(host) {
   function escHtml(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
       { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function isUploaderBookkeepingPatch(patch) {
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) return false;
+    if (Object.keys(patch).length !== 1 || !patch.annotations) return false;
+    const annotations = patch.annotations;
+    if (typeof annotations !== "object" || Array.isArray(annotations) || Object.keys(annotations).length !== 1 || !annotations.extras) return false;
+    const extras = annotations.extras;
+    if (typeof extras !== "object" || Array.isArray(extras)) return false;
+    const keys = Object.keys(extras);
+    return keys.length > 0 && keys.every((key) => key === "uploaded_to_decent" || key === "decent_upload_rejected");
   }
 
   // Human-readable page listing the most recent uploads, each linking to the shot
@@ -508,7 +525,7 @@ function createPlugin(host) {
       unloaded = true;
       if (reconcileTimerId !== null) clearTimeout(reconcileTimerId);
       reconcileTimerId = null;
-      pendingLiveShotIds = [];
+      pendingLiveShots = [];
     },
 
     onEvent(event) {
@@ -516,6 +533,14 @@ function createPlugin(host) {
         case "shotStored": {
           const id = event.payload && event.payload.id;
           if (id && state.autoUpload) autoUpload(id);
+          break;
+        }
+        case "shotUpdated": {
+          const payload = event.payload || {};
+          // Marker PUTs emit shotUpdated too; only suppress patches exclusively owned by this uploader.
+          if (payload.id && state.autoUpload && !isUploaderBookkeepingPatch(payload.patch)) {
+            autoUpload(payload.id, true);
+          }
           break;
         }
         case "storageRead":
@@ -545,7 +570,7 @@ function createPlugin(host) {
           if (!state.autoUpload) {
             if (reconcileTimerId !== null) clearTimeout(reconcileTimerId);
             reconcileTimerId = null;
-            pendingLiveShotIds = [];
+            pendingLiveShots = [];
           } else if (state.autoUpload) {
             if (!wasEnabled) {
               reconciliationPausedForConsent = false;
@@ -586,7 +611,7 @@ function createPlugin(host) {
         try {
           const latest = await fetchLocal("/shots/latest");
           if (!latest || !latest.id) return jsonResponse(404, { ok: false, error: "no shot available" });
-          const result = await uploadShot(latest.id, true);
+          const result = await uploadShot(latest.id, { manualRetry: true });
           return jsonResponse(200, { ok: true, id: latest.id, url: state.lastUrl, result: result });
         } catch (e) {
           if (e.skipped) return jsonResponse(200, { ok: false, skipped: true, error: e.message });
