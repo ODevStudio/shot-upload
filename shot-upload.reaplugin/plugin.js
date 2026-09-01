@@ -46,6 +46,7 @@ function createPlugin(host) {
   let pendingLiveShots = [];
   const remotelyPostedShotIds = new Set();
   const permanentlyRejectedShotIds = new Set();
+  let uploadedMachinesByShotId = new Map();
   let pendingReplacementShotIds = new Set();
   let reconcileTimerId = null;
   let reconciliationPausedForConsent = false;
@@ -143,6 +144,11 @@ function createPlugin(host) {
       ...(machine.firmwareVersion ? { firmwareVersion: String(machine.firmwareVersion) } : {}),
       ...(machine.model ? { model: String(machine.model) } : {}),
     };
+  }
+
+  function recordUploadedMachine(shotId, machine) {
+    uploadedMachinesByShotId = new Map([...uploadedMachinesByShotId, [shotId, { ...machine }]]);
+    try { host.storage({ type: "write", key: "uploadedMachines", data: Object.fromEntries(uploadedMachinesByShotId) }); } catch (e) {}
   }
 
   async function withMachine(shot, manualRetry, replacementMachine) {
@@ -254,8 +260,7 @@ function createPlugin(host) {
       throw skipped(`shot too short (${dur.toFixed(1)}s < ${state.lengthThreshold}s)`, true);
     }
 
-    const previousUpload = replace && state.recentUploads.find((entry) => entry && entry.localId === full.id && entry.sn);
-    const replacementMachine = replace ? (previousUpload ? { serialNumber: String(previousUpload.sn) } : null) : undefined;
+    const replacementMachine = replace ? (uploadedMachinesByShotId.get(full.id) || null) : undefined;
     const payload = await withMachine(full, manualRetry, replacementMachine);
     if (!payload) {
       const captured = full.workflow && full.workflow.machine;
@@ -274,6 +279,7 @@ function createPlugin(host) {
       throw e;
     }
     remotelyPostedShotIds.add(full.id);
+    recordUploadedMachine(full.id, payload.machine);
     await markUploaded(full.id);
     state.lastUploadedShot = full.id;
     state.lastResult = result;
@@ -566,6 +572,7 @@ function createPlugin(host) {
       try { host.storage({ type: "read", key: "lastUploadedShot" }); } catch (e) {}
       try { host.storage({ type: "read", key: "reconcileOffset" }); } catch (e) {}
       try { host.storage({ type: "read", key: "recentUploads" }); } catch (e) {}
+      try { host.storage({ type: "read", key: "uploadedMachines" }); } catch (e) {}
       try { host.storage({ type: "read", key: "pendingReplacementShotIds" }); } catch (e) {}
       log(`loaded (autoUpload ${state.autoUpload})`);
       scheduleReconcile(1000);
@@ -605,6 +612,15 @@ function createPlugin(host) {
           if (event.payload && event.payload.key === "recentUploads") {
             const v = event.payload.value;
             state.recentUploads = Array.isArray(v) ? v.slice(0, RECENT_MAX) : [];
+          }
+          if (event.payload && event.payload.key === "uploadedMachines") {
+            const v = event.payload.value;
+            const stored = v && typeof v === "object" && !Array.isArray(v)
+              ? Object.entries(v)
+                .map(([shotId, machine]) => [shotId, capturedMachine({ workflow: { machine } })])
+                .filter(([, machine]) => machine)
+              : [];
+            uploadedMachinesByShotId = new Map([...stored, ...uploadedMachinesByShotId]);
           }
           if (event.payload && event.payload.key === "pendingReplacementShotIds") {
             const ids = Array.isArray(event.payload.value) ? event.payload.value.filter((id) => typeof id === "string" && id) : [];

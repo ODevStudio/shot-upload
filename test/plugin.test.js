@@ -79,6 +79,7 @@ function loadPlugin({
   const fetches = [];
   const puts = [];
   const emits = [];
+  const storageCalls = [];
   const timers = [];
   const fullShots = new Map(shots.map((item) => [item.id, item]));
   let nextTimerId = 0;
@@ -175,7 +176,9 @@ function loadPlugin({
     emit(name, payload) {
       emits.push({ name, payload });
     },
-    storage() {},
+    storage(operation) {
+      storageCalls.push(operation);
+    },
     async decentProxy(proxyPath, options) {
       if (consentDenied) {
         const error = new Error("account consent denied");
@@ -201,6 +204,7 @@ function loadPlugin({
     fetches,
     puts,
     emits,
+    storageCalls,
     setMachineState(value) {
       machineState = value;
     },
@@ -280,14 +284,56 @@ test("shotUpdated replaces an uploaded shot with its latest persisted metadata",
   assert.equal(Boolean(harness.puts[0].body.annotations.extras.uploaded_to_decent), true);
 });
 
-test("legacy replacement keeps the machine used for the original upload", async () => {
-  const harness = loadPlugin({
+test("legacy replacement restores the full machine used for the original upload", async () => {
+  const original = loadPlugin({
     shots: [shot("legacy", { capturedMachine: false })],
+    connectedMachine: { serialNumber: "machine-a", model: "DE1Pro", version: "1352" },
+  });
+
+  original.plugin.onEvent({ name: "shotStored", payload: { id: "legacy" } });
+  await pump();
+  const storedMachines = original.storageCalls
+    .filter((call) => call.type === "write" && call.key === "uploadedMachines")
+    .at(-1).data;
+  const replacement = loadPlugin({
+    shots: [shot("legacy", { capturedMachine: false, uploaded: true })],
+    connectedMachine: { serialNumber: "machine-b", model: "DE1XL", version: "1400" },
+  });
+  replacement.plugin.onEvent({
+    name: "storageRead",
+    payload: { key: "uploadedMachines", value: storedMachines },
+  });
+  replacement.plugin.onEvent({
+    name: "shotUpdated",
+    payload: { id: "legacy", patch: { annotations: { espressoNotes: "edited" } } },
+  });
+  await pump();
+
+  assert.equal(replacement.proxyCalls.length, 1);
+  assert.deepEqual(JSON.parse(replacement.proxyCalls[0].options.body).machine, {
+    serialNumber: "machine-a",
+    firmwareVersion: "1352",
+    model: "DE1Pro",
+  });
+  assert.equal(replacement.proxyCalls[0].options.query.replace, "1");
+});
+
+test("legacy replacement identity outlives the recent upload list", async () => {
+  const laterShots = Array.from({ length: 10 }, (_, index) => shot(`later-${index}`));
+  const harness = loadPlugin({
+    shots: [shot("legacy", { capturedMachine: false }), ...laterShots],
     connectedMachine: { serialNumber: "machine-a", model: "DE1Pro", version: "1352" },
   });
 
   harness.plugin.onEvent({ name: "shotStored", payload: { id: "legacy" } });
   await pump();
+  for (const later of laterShots) {
+    harness.plugin.onEvent({ name: "shotStored", payload: { id: later.id } });
+    await pump();
+  }
+  const recent = await harness.plugin.__httpRequestHandler({ endpoint: "recent" });
+  assert.equal(JSON.parse(recent.body).shots.some((entry) => entry.localId === "legacy"), false);
+
   harness.setConnectedMachine({ serialNumber: "machine-b", model: "DE1XL", version: "1400" });
   harness.plugin.onEvent({
     name: "shotUpdated",
@@ -295,10 +341,8 @@ test("legacy replacement keeps the machine used for the original upload", async 
   });
   await pump();
 
-  assert.equal(harness.proxyCalls.length, 2);
-  assert.equal(JSON.parse(harness.proxyCalls[0].options.body).machine.serialNumber, "machine-a");
-  assert.equal(JSON.parse(harness.proxyCalls[1].options.body).machine.serialNumber, "machine-a");
-  assert.equal(harness.proxyCalls[1].options.query.replace, "1");
+  assert.equal(harness.proxyCalls.length, 12);
+  assert.equal(JSON.parse(harness.proxyCalls.at(-1).options.body).machine.serialNumber, "machine-a");
 });
 
 test("replacement ignores a length threshold raised after initial upload", async () => {
