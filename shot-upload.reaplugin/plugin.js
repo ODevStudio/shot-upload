@@ -113,6 +113,7 @@ function createPlugin(host) {
         decent_upload_rejected: {
           status: error.status,
           timestamp: Math.floor(Date.now() / 1000),
+          ...(error.updatedAt ? { updatedAt: error.updatedAt } : {}),
         },
       });
     } catch (e) {
@@ -282,7 +283,10 @@ function createPlugin(host) {
     try {
       result = await postShot(payload, replace);
     } catch (e) {
-      if (e.permanent) permanentlyRejectedShotIds.add(full.id);
+      if (e.permanent) {
+        permanentlyRejectedShotIds.add(full.id);
+        if (typeof full.updatedAt === "string" && full.updatedAt) e.updatedAt = full.updatedAt;
+      }
       throw e;
     }
     remotelyPostedShotIds.add(full.id);
@@ -444,8 +448,16 @@ function createPlugin(host) {
   }
 
   function reconciliationReplacement(shot) {
-    const synced = shot && uploadedRevisionsByShotId.get(shot.id);
-    return Boolean(wasUploaded(shot) && synced && typeof shot.updatedAt === "string" && shot.updatedAt !== synced);
+    if (!wasUploaded(shot) || typeof shot.updatedAt !== "string" || !shot.updatedAt) return false;
+    const rejected = extrasFor(shot).decent_upload_rejected;
+    if (rejected && rejected.updatedAt === shot.updatedAt) return false;
+    const synced = uploadedRevisionsByShotId.get(shot.id);
+    if (synced) return shot.updatedAt !== synced;
+    const uploadedAt = Number(extrasFor(shot).uploaded_to_decent);
+    const updatedAt = Date.parse(shot.updatedAt);
+    if (uploadedAt > 0 && Number.isFinite(updatedAt) && Math.floor(updatedAt / 1000) > uploadedAt) return true;
+    recordUploadedRevision(shot);
+    return false;
   }
 
   function setReconcileOffset(offset) {

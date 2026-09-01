@@ -13,7 +13,9 @@ function shot(
     provenanceStatus = "captured",
     capturedMachine = true,
     uploaded = false,
+    uploadedAt,
     rejected = false,
+    rejectedRevision,
     mockDeviceSkipped = false,
     espressoNotes,
     updatedAt,
@@ -25,9 +27,15 @@ function shot(
     annotations: {
       ...(espressoNotes ? { espressoNotes } : {}),
       extras: {
-        ...(uploaded ? { uploaded_to_decent: 1 } : {}),
+        ...(uploaded ? { uploaded_to_decent: uploadedAt ?? 1 } : {}),
         ...(rejected
-          ? { decent_upload_rejected: { status: 422, timestamp: 1 } }
+          ? {
+              decent_upload_rejected: {
+                status: 422,
+                timestamp: 1,
+                ...(rejectedRevision ? { updatedAt: rejectedRevision } : {}),
+              },
+            }
           : {}),
         ...(mockDeviceSkipped ? { upload_skipped: "mock-device" } : {}),
       },
@@ -435,6 +443,33 @@ test("restored matching updatedAt skips replacement until the revision changes",
   assert.equal(harness.proxyCalls[0].options.query.replace, "1");
 });
 
+test("reconciliation bootstraps revisions for uploads made before v0.2.3", async () => {
+  const firstRevision = "2026-09-01T18:23:45.123456Z";
+  const secondRevision = "2026-09-01T18:26:46.654321Z";
+  const uploadedAt = Date.parse("2026-09-01T18:24:00Z") / 1000;
+  const harness = loadPlugin({
+    shots: [shot("legacy-upload", { uploaded: true, uploadedAt, updatedAt: firstRevision })],
+  });
+
+  assert.equal(await harness.runNextTimer(), true);
+  assert.equal(harness.proxyCalls.length, 0);
+  const storedRevisions = harness.storageCalls
+    .filter((call) => call.type === "write" && call.key === "uploadedRevisions")
+    .at(-1).data;
+  assert.equal(storedRevisions["legacy-upload"], firstRevision);
+
+  harness.updateShot("legacy-upload", shot("legacy-upload", {
+    uploaded: true,
+    uploadedAt,
+    espressoNotes: "changed while stopped",
+    updatedAt: secondRevision,
+  }));
+  assert.equal(await harness.runNextTimer(), true);
+
+  assert.equal(harness.proxyCalls.length, 1);
+  assert.equal(harness.proxyCalls[0].options.query.replace, "1");
+});
+
 test("old Decaid shots without updatedAt still upload and replace from events", async () => {
   const harness = loadPlugin({ shots: [shot("legacy")] });
 
@@ -636,6 +671,42 @@ test("a corrected edit retries after permanent replacement rejection", async () 
   assert.equal(harness.proxyCalls.length, 2);
   assert.equal(harness.proxyCalls[1].options.query.replace, "1");
   assert.equal(JSON.parse(harness.proxyCalls[1].options.body).annotations.espressoNotes, "corrected");
+});
+
+test("reconciliation retries a permanently rejected replacement only after another edit", async () => {
+  const firstRevision = "2026-09-01T18:23:45.123456Z";
+  const rejectedRevision = "2026-09-01T18:24:46.654321Z";
+  const correctedRevision = "2026-09-01T18:25:47.765432Z";
+  const harness = loadPlugin({
+    shots: [shot("edited", { uploaded: true, updatedAt: rejectedRevision })],
+    responseStatuses: [422, 200],
+  });
+
+  harness.plugin.onEvent({
+    name: "storageRead",
+    payload: { key: "uploadedRevisions", value: { edited: firstRevision } },
+  });
+  assert.equal(await harness.runNextTimer(), true);
+  assert.equal(harness.proxyCalls.length, 1);
+  assert.equal(
+    harness.puts.at(-1).body.annotations.extras.decent_upload_rejected.updatedAt,
+    rejectedRevision,
+  );
+
+  assert.equal(await harness.runNextTimer(), true);
+  assert.equal(harness.proxyCalls.length, 1);
+
+  harness.updateShot("edited", shot("edited", {
+    uploaded: true,
+    rejected: true,
+    rejectedRevision,
+    espressoNotes: "corrected while stopped",
+    updatedAt: correctedRevision,
+  }));
+  assert.equal(await harness.runNextTimer(), true);
+
+  assert.equal(harness.proxyCalls.length, 2);
+  assert.equal(harness.proxyCalls[1].options.query.replace, "1");
 });
 
 test("pending replacement resumes from plugin storage", async () => {
