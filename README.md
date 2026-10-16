@@ -10,6 +10,35 @@ Download `shot-upload.reaplugin-vX.Y.Z.zip` from Releases and install it through
 
 Automatic upload is off by default. Enable **Upload shots automatically** in the plugin settings to opt in.
 
+## Upload pauses
+
+Before uploading, the plugin checks the shot's original serial against
+`support/api/sn?onlyespressomachines=1&withskus=1` through Decaid's authenticated
+proxy. A missing serial or an upload HTTP 403 pauses that serial for the session;
+other linked machines can keep uploading. Live, backlog, replacement, and manual
+uploads share this guard. The plugin preserves paused shots without rewriting
+their machine identity or marking them permanently rejected.
+
+HTTP 401 pauses the account's uploads and asks the user to sign in again.
+Machine-list outages or unexpected responses hold uploads with a one-minute
+backoff, without claiming the machine is unlinked. Existing transient upload
+retries and permanent document rejections, including HTTP 400, are unchanged.
+
+Restarting refreshes ownership. Decaid's `decentAccountChanged` event also
+invalidates the cache; uploads resume only after the new lookup confirms the
+serial is linked. Older Decaid versions without this event recheck on restart.
+Returning from the native Support action invalidates the uploader cache before
+the host refreshes its own machine list. A temporary host-refresh failure does
+not prevent the uploader's lookup/backoff from recovering. Account changes during
+an active request discard stale failures and trigger immediate reconciliation.
+The plugin needs both `proxy.decent_api` and `proxy.decent_api.write` permissions.
+
+The status endpoint includes `pausedSerials` and `authenticationPaused`.
+`uploadPaused` carries `{reason, serialNumber, message, timestamp}`, with reason
+`unlinked_serial` or `authentication` and a null serial for authentication.
+Compatible Decaid versions show a native notice with a support or sign-in action.
+The plugin's existing UI also shows the current pauses.
+
 ## Links to uploaded shots
 
 After a shot uploads, the plugin records a link to view it in the user's Decent
@@ -29,7 +58,7 @@ The distributable source is plain JavaScript and JSON under `shot-upload.reaplug
 
 ```bash
 node --check shot-upload.reaplugin/plugin.js
-node --test test/plugin.test.js
+node --test test/plugin.test.js test/ownership.test.js
 ```
 
 The tests exercise the public plugin lifecycle and HTTP interfaces with an in-memory Decaid host.
