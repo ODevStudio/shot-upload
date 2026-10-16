@@ -46,6 +46,7 @@ function createPlugin(host) {
   let uploadedMachinesByShotId = new Map();
   let uploadedRevisionsByShotId = new Map();
   let pendingReplacementShotIds = new Set();
+  let pendingReplacementIterator = null;
   let reconcileTimerId = null;
   let reconciliationPausedForConsent = false;
   let unloaded = false;
@@ -55,6 +56,7 @@ function createPlugin(host) {
   let accountGeneration = 0;
   let machineListRetryAfter = 0;
   let pausedSerials = new Set();
+  let pausedShotSerials = new Map();
   let authenticationPaused = false;
   const state = {
     autoUpload: false, // opt-in; see header
@@ -94,7 +96,7 @@ function createPlugin(host) {
             if (response && response.status === 401) throw pauseUpload("authentication", null);
             if (!response || response.status !== 200 || typeof response.body !== "string") throw new Error("account machine list temporarily unavailable");
             const lines = response.body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-            if (lines.some((line) => line === "0" || !/^[A-Za-z0-9._-]+(?:\s+DE-[A-Za-z0-9._+-]+)?$/.test(line))) throw new Error("unexpected account machine list response");
+            if (lines.some((line) => /^0\s/.test(line) || !/^[A-Za-z0-9._-]+\s+DE-[A-Za-z0-9._+-]+$/.test(line))) throw new Error("unexpected account machine list response");
             accountSerials = new Set(lines.map((line) => line.split(/\s+/)[0]));
             pausedSerials = new Set([...pausedSerials].filter((serial) => !accountSerials.has(serial)));
           } catch (error) {
@@ -297,23 +299,22 @@ function createPlugin(host) {
     error.terminal = terminal;
     return error;
   }
-
   async function uploadShot(shotId, { manualRetry = false, replace = false } = {}) {
+    await Promise.resolve();
+    if (authenticationPaused) throw pauseUpload("authentication", null);
+    if (pausedShotSerials.has(shotId)) throw pauseUpload("unlinked_serial", pausedShotSerials.get(shotId));
     if (!replace && remotelyPostedShotIds.has(shotId)) throw skipped(`shot ${shotId} already uploaded`, true);
     if (!replace && !manualRetry && permanentlyRejectedShotIds.has(shotId)) throw skipped(`shot ${shotId} was rejected`, true);
     const full = await fetchLocal(`/shots/${shotId}`);
     if (!full || !full.id) throw skipped(`shot ${shotId} not found`, true);
-
     const extras = extrasFor(full);
     if (!replace && extras.uploaded_to_decent) throw skipped(`shot ${shotId} already uploaded`, true);
     if (!replace && extras.decent_upload_rejected && !manualRetry) throw skipped(`shot ${shotId} was rejected`, true);
     if (extras.upload_skipped === "mock-device") throw skipped(`shot ${shotId} came from a mock device`, true);
-
     const dur = shotDuration(full);
     if (!replace && dur < state.lengthThreshold) {
       throw skipped(`shot too short (${dur.toFixed(1)}s < ${state.lengthThreshold}s)`, true);
     }
-
     const replacementMachine = replace ? (uploadedMachinesByShotId.get(full.id) || null) : undefined;
     const payload = await withMachine(full, manualRetry, replacementMachine);
     if (!payload) {
@@ -324,11 +325,13 @@ function createPlugin(host) {
         : Boolean(captured.serialNumber) && capturedMachine(full) === null));
       throw skipped("no real machine serial available", terminal);
     }
-
     let result;
     try {
       result = await postShot(payload, replace);
     } catch (e) {
+      if (e.skipped && pausedSerials.has(payload.machine.serialNumber)) {
+        pausedShotSerials = new Map([...pausedShotSerials, [shotId, payload.machine.serialNumber]]);
+      }
       if (e.permanent) {
         permanentlyRejectedShotIds.add(full.id);
         if (typeof full.updatedAt === "string" && full.updatedAt) e.updatedAt = full.updatedAt;
@@ -359,7 +362,6 @@ function createPlugin(host) {
     host.emit("shotUploaded", { shotId: full.id, id: serverId, sn: sn || null, url: url, result: result, timestamp: Date.now() });
     return result;
   }
-
   function queueLiveShot(operation) {
     const queued = pendingLiveShots.find((item) => item.shotId === operation.shotId);
     pendingLiveShots = queued
@@ -368,29 +370,24 @@ function createPlugin(host) {
         : item)
       : [...pendingLiveShots, operation];
   }
-
   function takeLiveShot() {
     const operation = pendingLiveShots[0];
     pendingLiveShots = pendingLiveShots.slice(1);
     return operation;
   }
-
   function persistPendingReplacements() {
     try { host.storage({ type: "write", key: "pendingReplacementShotIds", data: [...pendingReplacementShotIds] }); } catch (e) {}
   }
-
   function markReplacementPending(shotId) {
     if (pendingReplacementShotIds.has(shotId)) return;
     pendingReplacementShotIds = new Set([...pendingReplacementShotIds, shotId]);
     persistPendingReplacements();
   }
-
   function clearReplacementPending(shotId) {
     if (!pendingReplacementShotIds.has(shotId)) return;
     pendingReplacementShotIds = new Set([...pendingReplacementShotIds].filter((id) => id !== shotId));
     persistPendingReplacements();
   }
-
   async function uploadAutomatically(operation) {
     const { shotId, replace } = operation;
     if (replace) markReplacementPending(shotId);
@@ -457,17 +454,14 @@ function createPlugin(host) {
   function currentMachineState(snapshot) {
     return snapshot && snapshot.state && snapshot.state.state || null;
   }
-
   function reconciliationIsSafe() {
     return SAFE_MACHINE_STATES.has(state.machineState);
   }
-
   async function confirmReconciliationIsSafe() {
     const snapshot = await fetchLocal("/machine/state");
     state.machineState = currentMachineState(snapshot);
     return reconciliationIsSafe();
   }
-
   function reconcileCandidate(shot) {
     const extras = extrasFor(shot);
     const captured = shot && shot.workflow && shot.workflow.machine;
@@ -489,7 +483,6 @@ function createPlugin(host) {
       extrasFor(shot).uploaded_to_decent
     ));
   }
-
   function reconciliationReplacement(shot) {
     if (!wasUploaded(shot) || typeof shot.updatedAt !== "string" || !shot.updatedAt) return false;
     const rejected = extrasFor(shot).decent_upload_rejected;
@@ -502,7 +495,6 @@ function createPlugin(host) {
     recordUploadedRevision(shot);
     return false;
   }
-
   function setReconcileOffset(offset) {
     state.reconcileOffset = offset;
     host.storage({ type: "write", key: "reconcileOffset", data: offset });
@@ -520,13 +512,18 @@ function createPlugin(host) {
       if (!await confirmReconciliationIsSafe()) return;
       let pages = 0;
       let attempts = 0;
-      for (const shotId of pendingReplacementShotIds) {
-        if (attempts >= RECONCILE_BATCH_SIZE || !state.autoUpload || reconciliationPausedForConsent || unloaded || !reconciliationIsSafe()) break;
+      if (!pendingReplacementIterator) pendingReplacementIterator = pendingReplacementShotIds.values();
+      for (let scanned = 0; scanned < RECONCILE_BATCH_SIZE; scanned++) {
+        if (attempts >= RECONCILE_BATCH_SIZE || !state.autoUpload || reconciliationPausedForConsent || authenticationPaused || unloaded || generation !== accountGeneration || !reconciliationIsSafe()) break;
+        const next = pendingReplacementIterator.next();
+        if (next.done) { pendingReplacementIterator = null; break; }
+        const shotId = next.value;
+        if (!pendingReplacementShotIds.has(shotId)) continue;
         const error = await uploadAutomatically({ shotId, replace: true });
         if (!error || !error.skipped) attempts++;
         if (error && !error.skipped && pendingReplacementShotIds.has(shotId)) throw error;
       }
-      while (pages < RECONCILE_PAGE_LIMIT && attempts < RECONCILE_BATCH_SIZE && state.autoUpload && !reconciliationPausedForConsent && !unloaded && reconciliationIsSafe()) {
+      while (pages < RECONCILE_PAGE_LIMIT && attempts < RECONCILE_BATCH_SIZE && state.autoUpload && !reconciliationPausedForConsent && !authenticationPaused && !unloaded && reconciliationIsSafe()) {
         const page = await fetchLocal(`/shots?limit=${RECONCILE_PAGE_SIZE}&offset=${state.reconcileOffset}&order=desc`);
         if (!page || !Array.isArray(page.items)) throw new Error("could not list local shots");
         if (page.items.length === 0 || state.reconcileOffset >= page.total) {
@@ -535,12 +532,12 @@ function createPlugin(host) {
         }
         let scanned = 0;
         for (const shot of page.items) {
-          if (!state.autoUpload || reconciliationPausedForConsent || unloaded || !reconciliationIsSafe() || attempts >= RECONCILE_BATCH_SIZE) break;
-          while (pendingLiveShots.length > 0 && attempts < RECONCILE_BATCH_SIZE && !reconciliationPausedForConsent) {
+          if (!state.autoUpload || reconciliationPausedForConsent || authenticationPaused || unloaded || !reconciliationIsSafe() || attempts >= RECONCILE_BATCH_SIZE) break;
+          while (pendingLiveShots.length > 0 && attempts < RECONCILE_BATCH_SIZE && !reconciliationPausedForConsent && !authenticationPaused) {
             await uploadAutomatically(takeLiveShot());
             attempts++;
           }
-          if (reconciliationPausedForConsent || attempts >= RECONCILE_BATCH_SIZE) break;
+          if (reconciliationPausedForConsent || authenticationPaused || attempts >= RECONCILE_BATCH_SIZE) break;
           scanned++;
           const replace = reconciliationReplacement(shot);
           if (!replace && !reconcileCandidate(shot)) continue;
@@ -562,7 +559,7 @@ function createPlugin(host) {
           break;
         }
       }
-      if (attempts >= RECONCILE_BATCH_SIZE) nextDelay = RECONCILE_CONTINUE_MS;
+      if (attempts >= RECONCILE_BATCH_SIZE || pendingReplacementIterator !== null) nextDelay = RECONCILE_CONTINUE_MS;
     } catch (e) {
       log(`reconciliation paused: ${e.message}`);
       if (e.consent) reconciliationPausedForConsent = true;
@@ -677,6 +674,9 @@ function createPlugin(host) {
         case "decentAccountChanged":
           accountGeneration++;
           accountSerials = null;
+          pausedSerials = new Set();
+          pausedShotSerials = new Map();
+          pendingReplacementIterator = null;
           accountRequest = null;
           machineListRetryAfter = 0;
           authenticationPaused = false;

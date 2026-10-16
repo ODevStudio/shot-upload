@@ -23,15 +23,24 @@ HTTP 401 pauses the account's uploads and asks the user to sign in again.
 Machine-list outages or unexpected responses hold uploads with a one-minute
 backoff, without claiming the machine is unlinked. Existing transient upload
 retries and permanent document rejections, including HTTP 400, are unchanged.
+Nonempty machine-list rows must include the SKU requested by `withskus=1`;
+unexpected plain text is an outage, not an ownership determination.
 
 Restarting refreshes ownership. Decaid's `decentAccountChanged` event also
 invalidates the cache; uploads resume only after the new lookup confirms the
 serial is linked. Older Decaid versions without this event recheck on restart.
+Serial pauses and their notification deduplication are reset on each account
+generation, so a new account never inherits the previous account's notices.
 Returning from the native Support action invalidates the uploader cache before
 the host refreshes its own machine list. A temporary host-refresh failure does
 not prevent the uploader's lookup/backoff from recovering. Account changes during
 an active request discard stale failures and trigger immediate reconciliation.
 The plugin needs both `proxy.decent_api` and `proxy.decent_api.write` permissions.
+
+Pending replacements scan at most five entries per pass, independently of the
+upload budget, and continue from their previous position. Known paused shots do
+not reload their full records until ownership is refreshed. Authentication pauses
+stop both replacement and backlog scans immediately.
 
 The status endpoint includes `pausedSerials` and `authenticationPaused`.
 `uploadPaused` carries `{reason, serialNumber, message, timestamp}`, with reason
@@ -58,7 +67,7 @@ The distributable source is plain JavaScript and JSON under `shot-upload.reaplug
 
 ```bash
 node --check shot-upload.reaplugin/plugin.js
-node --test test/plugin.test.js test/ownership.test.js
+node --test test/plugin.test.js test/ownership.test.js test/ownership_review.test.js
 ```
 
 The tests exercise the public plugin lifecycle and HTTP interfaces with an in-memory Decaid host.
