@@ -76,7 +76,16 @@ function createPlugin(host) {
     const alreadyPaused = reason === "authentication" ? authenticationPaused : pausedSerials.has(serialNumber);
     if (reason === "authentication") authenticationPaused = true;
     else pausedSerials = new Set([...pausedSerials, serialNumber]);
-    if (!alreadyPaused) host.emit("uploadPaused", { reason, serialNumber: serialNumber || null, message, timestamp: Date.now() });
+    if (!alreadyPaused) {
+      host.emit("uploadPaused", { reason, serialNumber: serialNumber || null, message, timestamp: Date.now() });
+      try {
+        const authentication = reason === "authentication";
+        if (authentication) host.dismissNotification?.("ownership");
+        if (authentication || pausedSerials.size === 1) host.notify?.({ id: authentication ? "authentication" : "ownership", message, action: authentication
+          ? { id: "signIn", label: "Sign In", type: "openDecentAccount" }
+          : { id: "support", label: "Support", type: "openExternalUrl", url: "https://decentespresso.com/support/" } });
+      } catch (error) { log(`could not show upload pause: ${error.message}`); }
+    }
     return skipped(message, false);
   }
   async function checkAccountSerial(serialNumber) {
@@ -125,13 +134,11 @@ function createPlugin(host) {
     state.recentUploads = [entry, ...state.recentUploads.filter((e) => e && e.id !== entry.id)].slice(0, RECENT_MAX);
     try { host.storage({ type: "write", key: "recentUploads", data: state.recentUploads }); } catch (e) {}
   }
-
   async function fetchLocal(path) {
     const res = await fetch(`${LOCAL_API_URL}${path}`);
     if (!res.ok) { log(`local ${path} -> ${res.status}`); return null; }
     return await res.json();
   }
-
   async function updateShotExtras(shotId, extras) {
     const res = await fetch(`${LOCAL_API_URL}/shots/${shotId}`, {
       method: "PUT",
@@ -140,7 +147,6 @@ function createPlugin(host) {
     });
     if (!res || !res.ok) throw new Error(`mark ${shotId} -> HTTP ${res && res.status}`);
   }
-
   async function markUploaded(shotId) {
     try {
       await updateShotExtras(shotId, {
@@ -151,7 +157,6 @@ function createPlugin(host) {
       log(`could not mark ${shotId} uploaded: ${e.message}`);
     }
   }
-
   async function markRejected(shotId, error) {
     try {
       await updateShotExtras(shotId, {
@@ -165,7 +170,6 @@ function createPlugin(host) {
       log(`could not mark ${shotId} rejected: ${e.message}`);
     }
   }
-
   // Decaid app version (for provenance), cached.
   async function getDecaidVersion() {
     if (decaidVersion) return decaidVersion;
@@ -173,7 +177,6 @@ function createPlugin(host) {
     decaidVersion = (info && (info.version || info.fullVersion)) || "unknown";
     return decaidVersion;
   }
-
   // seconds between first and last measurement
   function shotDuration(shot) {
     const m = shot && shot.measurements;
@@ -182,7 +185,6 @@ function createPlugin(host) {
     const t1 = Date.parse(m[m.length - 1].machine.timestamp);
     return isNaN(t0) || isNaN(t1) ? 0 : (t1 - t0) / 1000;
   }
-
   function capturedMachine(shot) {
     const machine = shot && shot.workflow && shot.workflow.machine;
     if (!machine || !machine.serialNumber || /^mock/i.test(String(machine.serialNumber))) return null;
@@ -579,12 +581,10 @@ function createPlugin(host) {
   function jsonResponse(status, obj) {
     return { status: status, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) };
   }
-
   function escHtml(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
       { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
-
   function isUploaderBookkeepingPatch(patch) {
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) return false;
     if (Object.keys(patch).length !== 1 || !patch.annotations) return false;
@@ -595,7 +595,6 @@ function createPlugin(host) {
     const keys = Object.keys(extras);
     return keys.length > 0 && keys.every((key) => key === "uploaded_to_decent" || key === "decent_upload_rejected" || key === "visualizerId");
   }
-
   async function handleShotUpdated(shotId) {
     const shot = await fetchLocal(`/shots/${shotId}`);
     if (!shot || !shot.id) return;
@@ -603,7 +602,6 @@ function createPlugin(host) {
     if (replace) markReplacementPending(shotId);
     autoUpload(shotId, replace);
   }
-
   // Human-readable page listing the most recent uploads, each linking to the shot
   // in the user's Decent account. Big tap targets — it may be shown on the DE1's
   // touchscreen.
@@ -641,7 +639,6 @@ function createPlugin(host) {
 </style></head>
 <body><h1>Recent uploaded shots</h1>${authenticationPaused ? '<p role="alert">Shot uploads are paused. Please sign in to your Decent account again.</p>' : ""}${[...pausedSerials].map((serial) => `<p role="alert">Shot uploads are paused: machine ${escHtml(serial)} isn't linked to your Decent account. <a href="https://decentespresso.com/support/">Contact support</a> to link it.</p>`).join("")}<ul class="shots">${list}</ul></body></html>`;
   }
-
   return {
     id: NS,
     version: VERSION,
@@ -671,7 +668,10 @@ function createPlugin(host) {
 
     onEvent(event) {
       switch (event.name) {
+        case "notificationAction":
+          if (event.payload?.id !== "ownership" || event.payload?.actionId !== "support" || event.payload?.phase !== "returned" || pausedSerials.size === 0) break;
         case "decentAccountChanged":
+          try { host.dismissNotification?.(); } catch (error) { log(`could not clear upload pauses: ${error.message}`); }
           accountGeneration++;
           accountSerials = null;
           pausedSerials = new Set();

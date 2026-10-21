@@ -28,14 +28,15 @@ unexpected plain text is an outage, not an ownership determination.
 
 Restarting refreshes ownership. Decaid's `decentAccountChanged` event also
 invalidates the cache; uploads resume only after the new lookup confirms the
-serial is linked. Older Decaid versions without this event recheck on restart.
+serial is linked. Restart is a check trigger, not a recovery prerequisite.
 Serial pauses and their notification deduplication are reset on each account
 generation, so a new account never inherits the previous account's notices.
-Returning from the native Support action invalidates the uploader cache before
-the host refreshes its own machine list. A temporary host-refresh failure does
-not prevent the uploader's lookup/backoff from recovering. Account changes during
+Returning from the native Support action invalidates the uploader cache; its
+own authenticated lookup/backoff determines recovery. Account changes during
 an active request discard stale failures and trigger immediate reconciliation.
-The plugin needs both `proxy.decent_api` and `proxy.decent_api.write` permissions.
+The plugin needs `proxy.decent_api`, `proxy.decent_api.write`, and `notifications`.
+This version requires a Decaid host supporting the generic notification contract;
+older hosts that reject unknown permissions cannot load its manifest.
 
 Pending replacements scan at most five entries per pass, independently of the
 upload budget, and continue from their previous position. Known paused shots do
@@ -45,8 +46,17 @@ stop both replacement and backlog scans immediately.
 The status endpoint includes `pausedSerials` and `authenticationPaused`.
 `uploadPaused` carries `{reason, serialNumber, message, timestamp}`, with reason
 `unlinked_serial` or `authentication` and a null serial for authentication.
-Compatible Decaid versions show a native notice with a support or sign-in action.
-The plugin's existing UI also shows the current pauses.
+The plugin supplies the native notice through `host.notify`: `ownership` opens
+its HTTPS Support URL, while `authentication` opens native account settings.
+The first ownership notice stays current when more serials pause, so an active
+Support action is not retired by backlog scanning. Authentication replaces that
+notice. Account changes clear only this plugin's notices. A targeted
+`notificationAction` with ID `ownership`, action
+`support`, and phase `returned` triggers a fresh ownership check. Merely opening
+the link, a failed launch, or an unrelated action cannot resume uploads.
+Decaid renders these through its generic permissioned banner without interpreting
+upload policy or clearing unrelated messages. The plugin's existing UI and
+`uploadPaused` event also retain their pause information.
 
 ## Links to uploaded shots
 
@@ -67,7 +77,7 @@ The distributable source is plain JavaScript and JSON under `shot-upload.reaplug
 
 ```bash
 node --check shot-upload.reaplugin/plugin.js
-node --test test/plugin.test.js test/ownership.test.js test/ownership_review.test.js
+node --test test/*.test.js
 ```
 
 The tests exercise the public plugin lifecycle and HTTP interfaces with an in-memory Decaid host.

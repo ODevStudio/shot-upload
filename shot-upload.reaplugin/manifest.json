@@ -9,6 +9,7 @@
     "log",
     "api",
     "emit",
+    "notifications",
     "pluginStorage",
     "proxy.decent_api",
     "proxy.decent_api.write",

@@ -82,6 +82,7 @@ function loadPlugin({
   consentDenied = false,
   annotationStatus = 200,
   beforeProxy,
+  notificationsAvailable = true,
   machineListResponses = [],
   registeredSerials = [...new Set([
     ...shots.map((item) => item.workflow?.machine?.serialNumber).filter(Boolean),
@@ -93,6 +94,8 @@ function loadPlugin({
   const fetches = [];
   const puts = [];
   const emits = [];
+  const notifications = [];
+  const dismissedNotifications = [];
   const storageCalls = [];
   const timers = [];
   const fullShots = new Map(shots.map((item) => [item.id, item]));
@@ -192,6 +195,10 @@ function loadPlugin({
   const statuses = [...responseStatuses];
   const lists = [...machineListResponses];
   const plugin = context.createPlugin({
+    ...(notificationsAvailable ? {
+      notify(value) { notifications.push(value); },
+      dismissNotification(id) { dismissedNotifications.push(id); },
+    } : {}),
     log() {},
     emit(name, payload) {
       emits.push({ name, payload });
@@ -234,6 +241,8 @@ function loadPlugin({
     fetches,
     puts,
     emits,
+    notifications,
+    dismissedNotifications,
     storageCalls,
     get nextTimerDelay() {
       return timers.find((timer) => !timer.cancelled)?.delay ?? null;
