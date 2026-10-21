@@ -48,9 +48,13 @@ The status endpoint includes `pausedSerials` and `authenticationPaused`.
 `unlinked_serial` or `authentication` and a null serial for authentication.
 The plugin supplies the native notice through `host.notify`: `ownership` opens
 its HTTPS Support URL, while `authentication` opens native account settings.
-The first ownership notice stays current when more serials pause, so an active
-Support action is not retired by backlog scanning. Authentication replaces that
-notice. Account changes clear only this plugin's notices. A targeted
+An outstanding ownership notice stays current when more serials pause, so an
+active Support action is not retired by backlog scanning. A targeted
+`notificationDismissed` for `ownership` acknowledges that notice without clearing
+any upload pause. A different serial pausing for the first time then gets a fresh
+Support notice; repeated shots from an already paused serial remain quiet.
+Authentication replaces the ownership notice. Account changes clear only this
+plugin's notices. A targeted
 `notificationAction` with ID `ownership`, action
 `support`, and phase `returned` triggers a fresh ownership check. Merely opening
 the link, a failed launch, or an unrelated action cannot resume uploads.

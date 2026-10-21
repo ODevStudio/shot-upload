@@ -38,6 +38,42 @@ test('additional paused serials do not replace an outstanding support action', a
   assert.equal(JSON.parse(response.body).pausedSerials.length, 2);
 });
 
+test('a new paused serial gets a notice after the previous ownership notice is dismissed', async () => {
+  const harness = loadPlugin({
+    shots: [shot('a'), shot('b', { serialNumber: '7000' })],
+    registeredSerials: [],
+  });
+  harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'a' } });
+  await pump();
+  assert.equal(harness.notifications.length, 1);
+  harness.plugin.onEvent({ name: 'notificationDismissed', payload: { id: 'ownership' } });
+  harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'a' } });
+  await pump();
+  assert.equal(harness.notifications.length, 1);
+  harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'b' } });
+  await pump();
+  assert.equal(harness.notifications.length, 2);
+  assert.match(harness.notifications.at(-1).message, /serial 7000/);
+  assert.equal(harness.notifications.at(-1).action.id, 'support');
+  assert.equal(harness.notifications.at(-1).action.type, 'openExternalUrl');
+  assert.equal(harness.proxyCalls.length, 0);
+  const response = await harness.plugin.__httpRequestHandler({ endpoint: 'status' });
+  assert.deepEqual(JSON.parse(response.body).pausedSerials, ['6262', '7000']);
+});
+
+test('unrelated user dismissals do not retire an outstanding ownership notice', async () => {
+  const harness = loadPlugin({
+    shots: [shot('a'), shot('b', { serialNumber: '7000' })],
+    registeredSerials: [],
+  });
+  harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'a' } });
+  await pump();
+  harness.plugin.onEvent({ name: 'notificationDismissed', payload: { id: 'authentication' } });
+  harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'b' } });
+  await pump();
+  assert.equal(harness.notifications.length, 1);
+});
+
 test('authentication supersedes the ownership notice without another support action', async () => {
   const harness = loadPlugin({
     shots: [shot('linked', { serialNumber: '7000' }), shot('missing')],
@@ -81,6 +117,8 @@ test('account changes clear stale native notices, not another plugin UI', async 
   assert.ok(harness.notifications.length);
   harness.plugin.onEvent({ name: 'decentAccountChanged', payload: {} });
   assert.ok(harness.dismissedNotifications.includes(undefined));
+  await harness.runNextTimer();
+  assert.equal(harness.notifications.length, 2);
 });
 
 test('missing optional notification methods do not bypass the ownership guard', async () => {

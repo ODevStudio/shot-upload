@@ -58,6 +58,7 @@ function createPlugin(host) {
   let pausedSerials = new Set();
   let pausedShotSerials = new Map();
   let authenticationPaused = false;
+  let ownershipNoticeOutstanding = false;
   const state = {
     autoUpload: false, // opt-in; see header
     lengthThreshold: 5,
@@ -81,9 +82,12 @@ function createPlugin(host) {
       try {
         const authentication = reason === "authentication";
         if (authentication) host.dismissNotification?.("ownership");
-        if (authentication || pausedSerials.size === 1) host.notify?.({ id: authentication ? "authentication" : "ownership", message, action: authentication
+        if (authentication || !ownershipNoticeOutstanding) {
+          host.notify?.({ id: authentication ? "authentication" : "ownership", message, action: authentication
           ? { id: "signIn", label: "Sign In", type: "openDecentAccount" }
           : { id: "support", label: "Support", type: "openExternalUrl", url: "https://decentespresso.com/support/" } });
+          ownershipNoticeOutstanding = !authentication;
+        }
       } catch (error) { log(`could not show upload pause: ${error.message}`); }
     }
     return skipped(message, false);
@@ -642,36 +646,33 @@ function createPlugin(host) {
   return {
     id: NS,
     version: VERSION,
-
     onLoad(settings) {
       unloaded = false;
       reconciliationPausedForConsent = false;
       applySettings(settings);
       // Storage reads are event-based: this triggers a `storageRead` event,
       // handled in onEvent, that restores lastUploadedShot.
-      try { host.storage({ type: "read", key: "lastUploadedShot" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "reconcileOffset" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "recentUploads" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "uploadedMachines" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "uploadedRevisions" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "pendingReplacementShotIds" }); } catch (e) {}
+      for (const key of ["lastUploadedShot", "reconcileOffset", "recentUploads", "uploadedMachines", "uploadedRevisions", "pendingReplacementShotIds"]) {
+        try { host.storage({ type: "read", key }); } catch (e) {}
+      }
       log(`loaded (autoUpload ${state.autoUpload})`);
       scheduleReconcile(1000);
     },
-
     onUnload() {
       unloaded = true;
       if (reconcileTimerId !== null) clearTimeout(reconcileTimerId);
       reconcileTimerId = null;
       pendingLiveShots = [];
     },
-
     onEvent(event) {
       switch (event.name) {
+        case "notificationDismissed":
+          if (event.payload?.id === "ownership") ownershipNoticeOutstanding = false;
+          break;
         case "notificationAction":
           if (event.payload?.id !== "ownership" || event.payload?.actionId !== "support" || event.payload?.phase !== "returned" || pausedSerials.size === 0) break;
         case "decentAccountChanged":
-          try { host.dismissNotification?.(); } catch (error) { log(`could not clear upload pauses: ${error.message}`); }
+          try { host.dismissNotification?.(); ownershipNoticeOutstanding = false; } catch (error) { log(`could not clear upload pauses: ${error.message}`); }
           accountGeneration++;
           accountSerials = null;
           pausedSerials = new Set();
@@ -756,7 +757,6 @@ function createPlugin(host) {
         }
       }
     },
-
     // Control endpoints. GET status; POST upload of the latest eligible shot.
     async __httpRequestHandler(request) {
       const endpoint = request && request.endpoint;
